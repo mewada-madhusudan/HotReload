@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyqt-hot-reload"
+version = "1.0.0"
+description = "Hot reload tool for PyQt applications with UI inspector"
+requires-python = ">=3.8"
+dependencies = [
+    "PyQt6>=6.0.0",
+    "watchdog>=2.1.0"
+]
+
+[project.scripts]
+pyqt-hot-reload = "launcher:main"
