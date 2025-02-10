@@ -5,8 +5,8 @@ import time
 import ast
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-from PyQt6.QtWidgets import QMainWindow, QWidget
-from PyQt6.QtCore import QObject
+from PyQt6.QtWidgets import QMainWindow, QWidget, QApplication
+from PyQt6.QtCore import QObject, QTimer
 
 class HotReloader(QObject):
     def __init__(self, file_path):
@@ -16,6 +16,7 @@ class HotReloader(QObject):
         self.main_window = None
         self.module = None
         self.observer = None
+        self.app = QApplication.instance() or QApplication(sys.argv)
         
         # Add project root to Python path
         if str(self.project_root) not in sys.path:
@@ -34,7 +35,7 @@ class HotReloader(QObject):
             if (current / 'requirements.txt').exists():
                 return current
             current = current.parent
-        return self.file_path.parent  # Fallback to file's directory
+        return self.file_path.parent
 
     def install_requirements(self):
         """Install dependencies from requirements.txt"""
@@ -59,32 +60,47 @@ class HotReloader(QObject):
             print(f"Error installing dependencies: {str(e)}")
             raise
 
-    def resolve_local_import(self, import_name, current_dir):
-        """Resolve a local import to its absolute path"""
-        # Check in the same directory
-        local_path = current_dir / f"{import_name}.py"
-        if local_path.exists():
-            return local_path
+    def cleanup_window(self):
+        """Safely cleanup the existing window"""
+        if self.main_window:
+            try:
+                # Schedule deletion for the next event loop iteration
+                self.main_window.deleteLater()
+                # Process any pending events
+                self.app.processEvents()
+                self.main_window = None
+            except Exception as e:
+                print(f"Error during window cleanup: {str(e)}")
 
-        # Check in project root and its subdirectories
-        for path in self.project_root.rglob(f"{import_name}.py"):
-            return path
-
-        return None
+    def cleanup_modules(self):
+        """Clean up project-related modules"""
+        project_path_str = str(self.project_root)
+        modules_to_reload = [
+            name for name, module in list(sys.modules.items())
+            if hasattr(module, '__file__') 
+            and module.__file__ 
+            and str(module.__file__).startswith(project_path_str)
+        ]
+        
+        for module_name in modules_to_reload:
+            try:
+                del sys.modules[module_name]
+            except KeyError:
+                pass
 
     def load_module(self, module_path, package=None):
         """Load a Python module from file path"""
-        module_name = module_path.stem
-        if package:
-            module_name = f"{package}.{module_name}"
-
-        spec = importlib.util.spec_from_file_location(module_name, module_path)
-        if spec is None:
-            raise ImportError(f"Could not load module: {module_path}")
-
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
         try:
+            module_name = module_path.stem
+            if package:
+                module_name = f"{package}.{module_name}"
+
+            spec = importlib.util.spec_from_file_location(module_name, module_path)
+            if spec is None:
+                raise ImportError(f"Could not load module: {module_path}")
+
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
             spec.loader.exec_module(module)
             return module
         except Exception as e:
@@ -93,22 +109,13 @@ class HotReloader(QObject):
             raise ImportError(f"Error loading module {module_path}: {str(e)}")
 
     def load_window(self):
+        """Load and display the window"""
         try:
-            # Clear any existing instances
-            if self.main_window:
-                self.main_window.close()
+            # Cleanup existing window and modules
+            self.cleanup_window()
+            self.cleanup_modules()
 
-            # Clear all project-related modules
-            project_path_str = str(self.project_root)
-            modules_to_reload = [
-                name for name, module in sys.modules.items()
-                if hasattr(module, '__file__') 
-                and str(module.__file__).startswith(project_path_str)
-            ]
-            for module_name in modules_to_reload:
-                del sys.modules[module_name]
-
-            # Load the main module and its local imports
+            # Load the main module
             self.module = self.load_module(self.file_path)
 
             # Find the main window class
@@ -129,29 +136,46 @@ class HotReloader(QObject):
 
         except Exception as e:
             print(f"Error loading window: {str(e)}")
-            raise
+            import traceback
+            traceback.print_exc()
 
     def start_file_observer(self):
         class FileChangeHandler(FileSystemEventHandler):
             def __init__(self, callback):
                 self.callback = callback
                 self.last_modified = 0
-                self.cooldown = 0.5
+                self.cooldown = 1.0  # Increased cooldown to prevent rapid reloads
+                self.pending_reload = False
+                self.timer = QTimer()
+                self.timer.timeout.connect(self.handle_reload)
+                self.timer.setSingleShot(True)
+
+            def handle_reload(self):
+                """Handle the actual reload"""
+                if self.pending_reload:
+                    self.pending_reload = False
+                    try:
+                        self.callback.load_window()
+                    except Exception as e:
+                        print(f"Error reloading window: {str(e)}")
 
             def on_modified(self, event):
                 if event.src_path.endswith('.py'):
                     current_time = time.time()
                     if current_time - self.last_modified > self.cooldown:
                         self.last_modified = current_time
-                        try:
-                            self.callback.load_window()
-                        except Exception as e:
-                            print(f"Error reloading window: {str(e)}")
+                        self.pending_reload = True
+                        # Schedule reload for next event loop iteration
+                        self.timer.start(100)  # 100ms delay
 
         self.observer = Observer()
         event_handler = FileChangeHandler(self)
         self.observer.schedule(event_handler, str(self.project_root), recursive=True)
         self.observer.start()
+
+    def run(self):
+        """Start the application event loop"""
+        return self.app.exec()
 
 def main(file_path):
     """Initialize and run the hot reloader"""
@@ -167,4 +191,6 @@ if __name__ == "__main__":
         print("Usage: python hot-reloader.py <path_to_qt_file>")
         sys.exit(1)
     
-    main(sys.argv[1])
+    reloader = main(sys.argv[1])
+    if reloader:
+        sys.exit(reloader.run())
