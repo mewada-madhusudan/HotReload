@@ -1,0 +1,97 @@
+from pathlib import Path
+import importlib.util
+import sys
+import time
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from PyQt6.QtWidgets import QMainWindow, QWidget
+from PyQt6.QtCore import pyqtSignal, QObject
+
+class ElementTree(QWidget):
+    element_selected = pyqtSignal(object)
+    # ... rest of the ElementTree implementation ...
+
+class HotReloader(QObject):
+    def __init__(self, file_path):
+        super().__init__()
+        self.file_path = Path(file_path)
+        self.main_window = None
+        self.module = None
+        self.observer = None
+        self.start_file_observer()
+        self.load_window()
+
+    def load_window(self):
+        try:
+            # Clear any existing instances
+            if self.main_window:
+                self.main_window.close()
+
+            # Remove the module from sys.modules to force reload
+            module_name = self.file_path.stem
+            if module_name in sys.modules:
+                del sys.modules[module_name]
+
+            # Load the module
+            spec = importlib.util.spec_from_file_location(module_name, self.file_path)
+            self.module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = self.module
+            spec.loader.exec_module(self.module)
+
+            # Find the main window class
+            main_window_class = None
+            for attr_name in dir(self.module):
+                attr = getattr(self.module, attr_name)
+                if isinstance(attr, type) and (issubclass(attr, QMainWindow) or issubclass(attr, QWidget)):
+                    if attr != QMainWindow and attr != QWidget:  # Skip base classes
+                        main_window_class = attr
+                        break
+
+            if not main_window_class:
+                raise Exception("No QMainWindow or QWidget subclass found in the module")
+
+            # Create and show the window
+            self.main_window = main_window_class()
+            self.main_window.show()
+
+        except Exception as e:
+            print(f"Error loading window: {str(e)}")
+            raise
+
+    def start_file_observer(self):
+        class FileChangeHandler(FileSystemEventHandler):
+            def __init__(self, callback):
+                self.callback = callback
+                self.last_modified = 0
+                self.cooldown = 0.5  # Cooldown period in seconds
+
+            def on_modified(self, event):
+                if event.src_path == str(self.callback.file_path):
+                    current_time = time.time()
+                    if current_time - self.last_modified > self.cooldown:
+                        self.last_modified = current_time
+                        try:
+                            self.callback.load_window()
+                        except Exception as e:
+                            print(f"Error reloading window: {str(e)}")
+
+        self.observer = Observer()
+        event_handler = FileChangeHandler(self)
+        self.observer.schedule(event_handler, str(self.file_path.parent), recursive=False)
+        self.observer.start()
+
+def check_dependencies():
+    """Check if required packages are installed in the virtual environment"""
+    required_packages = {
+        'PyQt6': 'PyQt6',
+        'watchdog': 'watchdog'
+    }
+    
+    missing_packages = []
+    for import_name, package_name in required_packages.items():
+        try:
+            __import__(import_name)
+        except ImportError:
+            missing_packages.append(package_name)
+    
+    return missing_packages
