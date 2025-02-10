@@ -11,50 +11,84 @@ from PyQt6.QtCore import pyqtSignal, QObject
 class ImportVisitor(ast.NodeVisitor):
     def __init__(self):
         self.imports = set()
+        self.local_imports = set()
 
     def visit_Import(self, node):
         for alias in node.names:
-            self.imports.add(alias.name.split('.')[0])
+            name = alias.name.split('.')[0]
+            if '.' not in alias.name:
+                self.imports.add(name)
+            else:
+                self.local_imports.add(name)
 
     def visit_ImportFrom(self, node):
         if node.module:
-            self.imports.add(node.module.split('.')[0])
+            name = node.module.split('.')[0]
+            if not node.level:  # absolute import
+                self.imports.add(name)
+            else:  # relative import
+                self.local_imports.add(name)
 
 class HotReloader(QObject):
     def __init__(self, file_path):
         super().__init__()
         self.file_path = Path(file_path)
+        self.project_root = self.file_path.parent
         self.main_window = None
         self.module = None
         self.observer = None
         
-        # Check and install file-specific dependencies first
+        # Add project root to Python path
+        if str(self.project_root) not in sys.path:
+            sys.path.insert(0, str(self.project_root))
+        
+        # Check and install dependencies first
         self.check_and_install_file_dependencies()
         
         self.start_file_observer()
         self.load_window()
 
     def check_and_install_file_dependencies(self):
-        """Check and install dependencies required by the UI file"""
+        """Check and install dependencies required by the UI file and its local imports"""
         try:
-            # Parse the Python file to find imports
-            with open(self.file_path, 'r', encoding='utf-8') as file:
-                tree = ast.parse(file.read())
-            
-            # Find all imports
-            visitor = ImportVisitor()
-            visitor.visit(tree)
-            
-            # Add required packages
             required_packages = {
                 'PyQt6': 'PyQt6',
                 'watchdog': 'watchdog'
             }
             
-            # Add file-specific imports
-            for import_name in visitor.imports:
-                if import_name not in ['sys', 'os', 'pathlib', 'typing']:  # Skip standard library modules
-                    required_packages[import_name] = import_name
+            # Recursively find all local Python files and their dependencies
+            checked_files = set()
+            to_check = {self.file_path}
+            
+            while to_check:
+                current_file = to_check.pop()
+                if current_file in checked_files:
+                    continue
+                    
+                checked_files.add(current_file)
+                
+                # Parse the Python file to find imports
+                with open(current_file, 'r', encoding='utf-8') as file:
+                    try:
+                        tree = ast.parse(file.read())
+                        visitor = ImportVisitor()
+                        visitor.visit(tree)
+                        
+                        # Add external package imports
+                        for import_name in visitor.imports:
+                            if import_name not in ['sys', 'os', 'pathlib', 'typing']:
+                                required_packages[import_name] = import_name
+                        
+                        # Add local imports to check
+                        for local_import in visitor.local_imports:
+                            potential_files = list(self.project_root.rglob(f"{local_import}.py"))
+                            for file_path in potential_files:
+                                if file_path.is_file():
+                                    to_check.add(file_path)
+                                    
+                    except SyntaxError:
+                        print(f"Warning: Syntax error in {current_file}")
+                        continue
             
             # Check for missing packages
             missing_packages = []
@@ -89,12 +123,17 @@ class HotReloader(QObject):
             if self.main_window:
                 self.main_window.close()
 
-            # Remove the module from sys.modules to force reload
-            module_name = self.file_path.stem
-            if module_name in sys.modules:
+            # Remove all project-related modules to force reload
+            project_modules = [name for name in sys.modules.keys() 
+                             if any(str(self.project_root) in str(getattr(module, '__file__', ''))
+                                   for module in [sys.modules[name]]
+                                   if hasattr(module, '__file__'))]
+            
+            for module_name in project_modules:
                 del sys.modules[module_name]
 
-            # Load the module
+            # Load the main module
+            module_name = self.file_path.stem
             spec = importlib.util.spec_from_file_location(module_name, self.file_path)
             self.module = importlib.util.module_from_spec(spec)
             sys.modules[module_name] = self.module
@@ -128,7 +167,7 @@ class HotReloader(QObject):
                 self.cooldown = 0.5  # Cooldown period in seconds
 
             def on_modified(self, event):
-                if event.src_path == str(self.callback.file_path):
+                if event.src_path.endswith('.py'):  # Watch all Python files
                     current_time = time.time()
                     if current_time - self.last_modified > self.cooldown:
                         self.last_modified = current_time
@@ -139,7 +178,8 @@ class HotReloader(QObject):
 
         self.observer = Observer()
         event_handler = FileChangeHandler(self)
-        self.observer.schedule(event_handler, str(self.file_path.parent), recursive=False)
+        # Watch the entire project directory for Python file changes
+        self.observer.schedule(event_handler, str(self.project_root), recursive=True)
         self.observer.start()
 
 def check_dependencies():
