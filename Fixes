@@ -6,34 +6,13 @@ import ast
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from PyQt6.QtWidgets import QMainWindow, QWidget
-from PyQt6.QtCore import pyqtSignal, QObject
-
-class ImportVisitor(ast.NodeVisitor):
-    def __init__(self):
-        self.imports = set()
-        self.local_imports = set()
-
-    def visit_Import(self, node):
-        for alias in node.names:
-            name = alias.name.split('.')[0]
-            if '.' not in alias.name:
-                self.imports.add(name)
-            else:
-                self.local_imports.add(name)
-
-    def visit_ImportFrom(self, node):
-        if node.module:
-            name = node.module.split('.')[0]
-            if not node.level:  # absolute import
-                self.imports.add(name)
-            else:  # relative import
-                self.local_imports.add(name)
+from PyQt6.QtCore import QObject
 
 class HotReloader(QObject):
     def __init__(self, file_path):
         super().__init__()
         self.file_path = Path(file_path)
-        self.project_root = self.file_path.parent
+        self.project_root = self.find_project_root()
         self.main_window = None
         self.module = None
         self.observer = None
@@ -42,80 +21,76 @@ class HotReloader(QObject):
         if str(self.project_root) not in sys.path:
             sys.path.insert(0, str(self.project_root))
         
-        # Check and install dependencies first
-        self.check_and_install_file_dependencies()
+        # Install dependencies from requirements.txt
+        self.install_requirements()
         
         self.start_file_observer()
         self.load_window()
 
-    def check_and_install_file_dependencies(self):
-        """Check and install dependencies required by the UI file and its local imports"""
-        try:
-            required_packages = {
-                'PyQt6': 'PyQt6',
-                'watchdog': 'watchdog'
-            }
-            
-            # Recursively find all local Python files and their dependencies
-            checked_files = set()
-            to_check = {self.file_path}
-            
-            while to_check:
-                current_file = to_check.pop()
-                if current_file in checked_files:
-                    continue
-                    
-                checked_files.add(current_file)
-                
-                # Parse the Python file to find imports
-                with open(current_file, 'r', encoding='utf-8') as file:
-                    try:
-                        tree = ast.parse(file.read())
-                        visitor = ImportVisitor()
-                        visitor.visit(tree)
-                        
-                        # Add external package imports
-                        for import_name in visitor.imports:
-                            if import_name not in ['sys', 'os', 'pathlib', 'typing']:
-                                required_packages[import_name] = import_name
-                        
-                        # Add local imports to check
-                        for local_import in visitor.local_imports:
-                            potential_files = list(self.project_root.rglob(f"{local_import}.py"))
-                            for file_path in potential_files:
-                                if file_path.is_file():
-                                    to_check.add(file_path)
-                                    
-                    except SyntaxError:
-                        print(f"Warning: Syntax error in {current_file}")
-                        continue
-            
-            # Check for missing packages
-            missing_packages = []
-            for import_name, package_name in required_packages.items():
-                try:
-                    __import__(import_name)
-                except ImportError:
-                    missing_packages.append(package_name)
-            
-            # Install missing packages
-            if missing_packages:
-                print(f"Installing required packages: {', '.join(missing_packages)}")
-                self.install_dependencies(missing_packages)
-                
-        except Exception as e:
-            print(f"Error checking dependencies: {str(e)}")
-            raise
+    def find_project_root(self):
+        """Find the project root by looking for requirements.txt"""
+        current = self.file_path.parent
+        while current != current.parent:
+            if (current / 'requirements.txt').exists():
+                return current
+            current = current.parent
+        return self.file_path.parent  # Fallback to file's directory
 
-    def install_dependencies(self, packages):
-        """Install the specified packages using pip"""
+    def install_requirements(self):
+        """Install dependencies from requirements.txt"""
+        requirements_file = self.project_root / 'requirements.txt'
+        if not requirements_file.exists():
+            print("No requirements.txt found in project root")
+            return
+
         try:
             import subprocess
-            for package in packages:
-                subprocess.check_call([sys.executable, '-m', 'pip', 'install', package])
+            print("Installing dependencies from requirements.txt...")
+            subprocess.check_call([
+                sys.executable, 
+                '-m', 
+                'pip', 
+                'install', 
+                '-r', 
+                str(requirements_file)
+            ])
+            print("Dependencies installed successfully")
         except subprocess.CalledProcessError as e:
             print(f"Error installing dependencies: {str(e)}")
             raise
+
+    def resolve_local_import(self, import_name, current_dir):
+        """Resolve a local import to its absolute path"""
+        # Check in the same directory
+        local_path = current_dir / f"{import_name}.py"
+        if local_path.exists():
+            return local_path
+
+        # Check in project root and its subdirectories
+        for path in self.project_root.rglob(f"{import_name}.py"):
+            return path
+
+        return None
+
+    def load_module(self, module_path, package=None):
+        """Load a Python module from file path"""
+        module_name = module_path.stem
+        if package:
+            module_name = f"{package}.{module_name}"
+
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        if spec is None:
+            raise ImportError(f"Could not load module: {module_path}")
+
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+            return module
+        except Exception as e:
+            if module_name in sys.modules:
+                del sys.modules[module_name]
+            raise ImportError(f"Error loading module {module_path}: {str(e)}")
 
     def load_window(self):
         try:
@@ -123,28 +98,25 @@ class HotReloader(QObject):
             if self.main_window:
                 self.main_window.close()
 
-            # Remove all project-related modules to force reload
-            project_modules = [name for name in sys.modules.keys() 
-                             if any(str(self.project_root) in str(getattr(module, '__file__', ''))
-                                   for module in [sys.modules[name]]
-                                   if hasattr(module, '__file__'))]
-            
-            for module_name in project_modules:
+            # Clear all project-related modules
+            project_path_str = str(self.project_root)
+            modules_to_reload = [
+                name for name, module in sys.modules.items()
+                if hasattr(module, '__file__') 
+                and str(module.__file__).startswith(project_path_str)
+            ]
+            for module_name in modules_to_reload:
                 del sys.modules[module_name]
 
-            # Load the main module
-            module_name = self.file_path.stem
-            spec = importlib.util.spec_from_file_location(module_name, self.file_path)
-            self.module = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = self.module
-            spec.loader.exec_module(self.module)
+            # Load the main module and its local imports
+            self.module = self.load_module(self.file_path)
 
             # Find the main window class
             main_window_class = None
             for attr_name in dir(self.module):
                 attr = getattr(self.module, attr_name)
                 if isinstance(attr, type) and (issubclass(attr, QMainWindow) or issubclass(attr, QWidget)):
-                    if attr != QMainWindow and attr != QWidget:  # Skip base classes
+                    if attr != QMainWindow and attr != QWidget:
                         main_window_class = attr
                         break
 
@@ -164,10 +136,10 @@ class HotReloader(QObject):
             def __init__(self, callback):
                 self.callback = callback
                 self.last_modified = 0
-                self.cooldown = 0.5  # Cooldown period in seconds
+                self.cooldown = 0.5
 
             def on_modified(self, event):
-                if event.src_path.endswith('.py'):  # Watch all Python files
+                if event.src_path.endswith('.py'):
                     current_time = time.time()
                     if current_time - self.last_modified > self.cooldown:
                         self.last_modified = current_time
@@ -178,22 +150,21 @@ class HotReloader(QObject):
 
         self.observer = Observer()
         event_handler = FileChangeHandler(self)
-        # Watch the entire project directory for Python file changes
         self.observer.schedule(event_handler, str(self.project_root), recursive=True)
         self.observer.start()
 
-def check_dependencies():
-    """Check if base required packages are installed"""
-    required_packages = {
-        'PyQt6': 'PyQt6',
-        'watchdog': 'watchdog'
-    }
+def main(file_path):
+    """Initialize and run the hot reloader"""
+    try:
+        reloader = HotReloader(file_path)
+        return reloader
+    except Exception as e:
+        print(f"Error initializing hot reloader: {str(e)}")
+        raise
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print("Usage: python hot-reloader.py <path_to_qt_file>")
+        sys.exit(1)
     
-    missing_packages = []
-    for import_name, package_name in required_packages.items():
-        try:
-            __import__(import_name)
-        except ImportError:
-            missing_packages.append(package_name)
-    
-    return missing_packages
+    main(sys.argv[1])
