@@ -7,7 +7,7 @@ import gc
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from PyQt6.QtWidgets import QMainWindow, QWidget, QApplication
-from PyQt6.QtCore import QObject, QTimer
+from PyQt6.QtCore import QObject, QTimer, Qt
 
 class HotReloader(QObject):
     def __init__(self, file_path):
@@ -17,6 +17,11 @@ class HotReloader(QObject):
         self.main_window = None
         self.module = None
         self.observer = None
+        self.reload_timer = QTimer()
+        self.reload_timer.setSingleShot(True)
+        self.reload_timer.timeout.connect(self._create_window)
+        
+        # Create QApplication
         self.app = QApplication.instance() or QApplication(sys.argv)
         
         # Add project root to Python path
@@ -27,7 +32,11 @@ class HotReloader(QObject):
         self.install_requirements()
         
         self.start_file_observer()
-        self.load_window()
+        self._delayed_initial_load()
+
+    def _delayed_initial_load(self):
+        """Initial load with a slight delay"""
+        QTimer.singleShot(100, self.load_window)
 
     def find_project_root(self):
         """Find the project root by looking for requirements.txt"""
@@ -68,11 +77,13 @@ class HotReloader(QObject):
                 # Hide the window first
                 self.main_window.hide()
                 
-                # Disconnect all signals
-                try:
-                    self.main_window.destroyed.disconnect()
-                except TypeError:
-                    pass  # No connections to disconnect
+                # Remove all children
+                for child in self.main_window.findChildren((QWidget, QObject)):
+                    try:
+                        child.setParent(None)
+                        child.deleteLater()
+                    except:
+                        pass
                 
                 # Set parent to None
                 self.main_window.setParent(None)
@@ -80,8 +91,8 @@ class HotReloader(QObject):
                 # Schedule deletion
                 self.main_window.deleteLater()
                 
-                # Process events immediately
-                self.app.processEvents()
+                # Process events
+                QApplication.processEvents()
                 
                 # Clear reference
                 self.main_window = None
@@ -109,7 +120,6 @@ class HotReloader(QObject):
             except KeyError:
                 pass
         
-        # Force garbage collection after module cleanup
         gc.collect()
 
     def load_module(self, module_path, package=None):
@@ -132,16 +142,9 @@ class HotReloader(QObject):
                 del sys.modules[module_name]
             raise ImportError(f"Error loading module {module_path}: {str(e)}")
 
-    def load_window(self):
-        """Load and display the window"""
+    def _create_window(self):
+        """Create and show the window"""
         try:
-            # Cleanup in reverse order
-            self.cleanup_window()
-            self.cleanup_modules()
-
-            # Load the main module
-            self.module = self.load_module(self.file_path)
-
             # Find the main window class
             main_window_class = None
             for attr_name in dir(self.module):
@@ -154,9 +157,39 @@ class HotReloader(QObject):
             if not main_window_class:
                 raise Exception("No QMainWindow or QWidget subclass found in the module")
 
-            # Create and show the window
+            # Create window
             self.main_window = main_window_class()
-            self.main_window.show()
+            
+            # Show window in the next event loop iteration
+            QTimer.singleShot(0, self._show_window)
+
+        except Exception as e:
+            print(f"Error creating window: {str(e)}")
+            import traceback
+            traceback.print_exc()
+
+    def _show_window(self):
+        """Show the window in a separate timer callback"""
+        try:
+            if self.main_window:
+                self.main_window.show()
+                self.main_window.raise_()
+                self.main_window.activateWindow()
+        except Exception as e:
+            print(f"Error showing window: {str(e)}")
+
+    def load_window(self):
+        """Load and display the window"""
+        try:
+            # Cleanup in reverse order
+            self.cleanup_window()
+            self.cleanup_modules()
+
+            # Load the main module
+            self.module = self.load_module(self.file_path)
+            
+            # Schedule window creation for next event loop iteration
+            QTimer.singleShot(100, self._create_window)
 
         except Exception as e:
             print(f"Error loading window: {str(e)}")
@@ -168,14 +201,13 @@ class HotReloader(QObject):
             def __init__(self, callback):
                 self.callback = callback
                 self.last_modified = 0
-                self.cooldown = 1.0  # Increased cooldown
+                self.cooldown = 1.0
                 self.pending_reload = False
                 self.timer = QTimer()
                 self.timer.timeout.connect(self.handle_reload)
                 self.timer.setSingleShot(True)
 
             def handle_reload(self):
-                """Handle the actual reload"""
                 if self.pending_reload:
                     self.pending_reload = False
                     try:
@@ -189,8 +221,8 @@ class HotReloader(QObject):
                     if current_time - self.last_modified > self.cooldown:
                         self.last_modified = current_time
                         self.pending_reload = True
-                        # Delay reload slightly to ensure file writing is complete
-                        self.timer.start(200)  # 200ms delay
+                        # Additional delay for file system operations
+                        self.timer.start(300)
 
         self.observer = Observer()
         event_handler = FileChangeHandler(self)
