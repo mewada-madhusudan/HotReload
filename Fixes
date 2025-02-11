@@ -3,6 +3,7 @@ import importlib.util
 import sys
 import time
 import ast
+import gc
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from PyQt6.QtWidgets import QMainWindow, QWidget, QApplication
@@ -62,15 +63,35 @@ class HotReloader(QObject):
 
     def cleanup_window(self):
         """Safely cleanup the existing window"""
-        if self.main_window:
+        if self.main_window is not None:
             try:
-                # Schedule deletion for the next event loop iteration
+                # Hide the window first
+                self.main_window.hide()
+                
+                # Disconnect all signals
+                try:
+                    self.main_window.destroyed.disconnect()
+                except TypeError:
+                    pass  # No connections to disconnect
+                
+                # Set parent to None
+                self.main_window.setParent(None)
+                
+                # Schedule deletion
                 self.main_window.deleteLater()
-                # Process any pending events
+                
+                # Process events immediately
                 self.app.processEvents()
+                
+                # Clear reference
                 self.main_window = None
+                
+                # Force garbage collection
+                gc.collect()
+                
             except Exception as e:
-                print(f"Error during window cleanup: {str(e)}")
+                print(f"Warning during window cleanup: {str(e)}")
+                self.main_window = None
 
     def cleanup_modules(self):
         """Clean up project-related modules"""
@@ -87,6 +108,9 @@ class HotReloader(QObject):
                 del sys.modules[module_name]
             except KeyError:
                 pass
+        
+        # Force garbage collection after module cleanup
+        gc.collect()
 
     def load_module(self, module_path, package=None):
         """Load a Python module from file path"""
@@ -111,7 +135,7 @@ class HotReloader(QObject):
     def load_window(self):
         """Load and display the window"""
         try:
-            # Cleanup existing window and modules
+            # Cleanup in reverse order
             self.cleanup_window()
             self.cleanup_modules()
 
@@ -144,7 +168,7 @@ class HotReloader(QObject):
             def __init__(self, callback):
                 self.callback = callback
                 self.last_modified = 0
-                self.cooldown = 1.0  # Increased cooldown to prevent rapid reloads
+                self.cooldown = 1.0  # Increased cooldown
                 self.pending_reload = False
                 self.timer = QTimer()
                 self.timer.timeout.connect(self.handle_reload)
@@ -165,8 +189,8 @@ class HotReloader(QObject):
                     if current_time - self.last_modified > self.cooldown:
                         self.last_modified = current_time
                         self.pending_reload = True
-                        # Schedule reload for next event loop iteration
-                        self.timer.start(100)  # 100ms delay
+                        # Delay reload slightly to ensure file writing is complete
+                        self.timer.start(200)  # 200ms delay
 
         self.observer = Observer()
         event_handler = FileChangeHandler(self)
